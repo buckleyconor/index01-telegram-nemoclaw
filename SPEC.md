@@ -78,26 +78,46 @@ Each voice note becomes one **job** with the following states:
 RECEIVED ──▶ FILTERED (no trigger phrase) ──▶ [end]
     │
     ▼
- PLANNING ──▶ PROPOSED ──▶ APPROVED ──▶ EXECUTING ──▶ REPORTED
-    │             │  │                       │
-    │             │  └──▶ DENIED ──▶ [end]   └──▶ FAILED
-    │             └─────▶ EXPIRED ──▶ [end]
+ PLANNING ──▶ PENDING_NOTIFY ──▶ PROPOSED ──▶ APPROVED ──▶ EXECUTING ──▶ REPORTED
+    │            (retry send)       │  │                       │
+    │                               │  └──▶ DENIED ──▶ [end]   └──▶ FAILED
+    │                               └─────▶ EXPIRED ──▶ [end]
     ▼
- REPORTED (read-only turns skip the gate entirely)
+ EXECUTING ──▶ REPORTED   (only when REQUIRE_APPROVAL_ALL is false
+                           and the transcript is classified read-only)
 ```
 
-Jobs persist in SQLite so a relay restart does not orphan a pending approval.
+`PENDING_NOTIFY` exists so a Telegram outage is retried rather than losing the
+proposal: a job only becomes `PROPOSED` once the owner can actually see it. A job
+never auto-approves from this state.
+
+Jobs persist in SQLite so a relay restart does not orphan a pending approval. On
+boot, `EXECUTING` jobs are marked `FAILED` (their subprocess is gone and cannot be
+resumed) while `PROPOSED` jobs survive and stay approvable, subject to the TTL.
 
 ### Classification rule (critical)
 
-Whether a job needs approval is decided by **static tool allowlist**, not by the
-model's own judgement. A model asked "is this dangerous?" is being asked to
-police itself and can be talked out of the answer by the very input under
-suspicion.
+Whether a job needs approval is decided **statically**, never by the model's own
+judgement. A model asked "is this dangerous?" is being asked to police itself and
+can be talked out of the answer by the very input under suspicion.
 
-- `TOOLS_READONLY` — executes immediately, result reported.
-- Anything not in `TOOLS_READONLY` — proposal only, requires approval.
-- Unrecognised tool name — treated as requiring approval (fail closed).
+The original design keyed this off a tool allowlist. Q4 removed that option: the
+agent cannot emit a plan before executing, so there is no tool name to inspect.
+Classification therefore runs over the **transcript**, in `classify()`:
+
+1. `REQUIRE_APPROVAL_ALL` (default **true**) — every turn requires approval.
+   Currently on, because a "read-only" turn still runs on an agent that could
+   mutate. See the residual risks in section 7.
+2. Otherwise, any match against `MUTATING_PATTERNS` requires approval. Checked
+   first and deliberately broad: a false positive costs one tap, a false negative
+   runs unreviewed.
+3. Otherwise, a match against `READONLY_PATTERNS` — anchored at the start of the
+   request — skips the gate.
+4. Otherwise **fail closed**: anything not affirmatively recognised as a read-only
+   question requires approval.
+
+The gate covers a whole agent turn, not a single tool call. The proposal message
+says so explicitly rather than implying a precision the design does not have.
 
 ## 6. Interfaces
 
@@ -144,8 +164,29 @@ Invoked via `asyncio.create_subprocess_exec` with an argument list. Never
 `create_subprocess_shell`, never string interpolation into a shell — the
 transcript is untrusted input and would become arbitrary code execution.
 
-**Exact CLI syntax: UNVERIFIED against v0.0.103.** Confirm from `nemoclaw --help`
-before first run.
+**Verified against NemoClaw v0.0.102 / OpenClaw 2026.7.1:**
+
+```
+nemoclaw <sandbox> agent --agent <id> --session-key index01-<job_id> \
+                         -m <transcript> --timeout <s> --json
+```
+
+- **`-m`, not `--message-file`.** `nemoclaw <name> agent` is a pass-through to
+  `openclaw agent` running *inside* the sandbox container, so `--message-file` is
+  resolved against the container's filesystem — a host path is simply not there.
+  Verified: an absolute host path fails `ENOENT`, and the same path is confirmed
+  absent inside the sandbox. Inline text is safe here because `create_subprocess_exec`
+  takes an explicit argv and no shell ever parses it; the only cost is the
+  transcript appearing briefly in `ps`, acceptable on a single-owner host.
+- **`--deliver` is never passed.** With it, the agent would reply to Telegram
+  itself and route around the gate.
+- **A fresh `--session-key` per job** keeps turns stateless (section 3) and stops
+  one note's content influencing the next.
+- **Output is pretty-printed JSON across many lines**, preceded by progress
+  output, so it is decoded from the first brace to the end and searched
+  breadth-first for the reply field — not parsed line by line.
+- Turns are **slow and variable**: observed between ~80 s and over 400 s on
+  identical prompts. `NEMOCLAW_TIMEOUT` is load-bearing.
 
 ## 7. Security requirements
 
@@ -191,26 +232,33 @@ before first run.
 
 | Variable | Example | Notes |
 |----------|---------|-------|
-| `INDEX01_SECRET` | random 32 bytes | shared with Pebble app header |
-| `TELEGRAM_BOT_TOKEN` | from @BotFather | full credential |
+| Variable | Example | Notes |
+|----------|---------|-------|
+| `INDEX01_SECRET` | random 32 bytes | shared with the Pebble app header |
+| `TELEGRAM_BOT_TOKEN` | from @BotFather | full credential; must be a bot nothing else polls (Q5) |
 | `TELEGRAM_OWNER_ID` | numeric user ID | allowlist of exactly one |
 | `TRIGGER_PHRASE` | `hey nemo` | notes without it are ignored |
-| `NEMOCLAW_TIMEOUT` | `300` | seconds |
-| `APPROVAL_TTL` | `900` | seconds |
+| `REQUIRE_APPROVAL_ALL` | `true` | gate every turn, bypassing `classify()`. Keep `true` while `NEMOCLAW_AGENT_RO` can mutate |
+| `NEMOCLAW_TIMEOUT` | `300` | seconds; turns observed from ~80 s to >400 s |
+| `APPROVAL_TTL` | `900` | seconds; checked at tap time, not only by a sweeper |
 | `DB_PATH` | `/var/lib/index01/jobs.db` | |
-| `LOG_TRANSCRIPTS` | `false` | `true` only during Phase 1 |
+| `LOG_TRANSCRIPTS` | `false` | when `true`, logs payload field *names* only, never values (S7) |
+| `NEMOCLAW_CMD` | `["/home/democenter/.local/bin/nemoclaw"]` | argv prefix as a JSON list; the privilege boundary is configuration, not code |
+| `NEMOCLAW_SANDBOX` | `the-king` | |
+| `NEMOCLAW_AGENT_RO` | `main` | agent for read-only turns; `main` can mutate, hence `REQUIRE_APPROVAL_ALL` |
+| `NEMOCLAW_AGENT_RW` | `main` | agent for gated turns |
 
 ## 9. Deployment profile
 
 | Item | Value |
 |------|-------|
 | Host | `relayhost`, arm64, Ubuntu |
-| Runtime | Python 3.11+, systemd unit `index01-relay.service` |
+| Runtime | Python 3.12.3, systemd unit `index01-relay.service`, runs as `democenter` (see Q6) |
 | Listen | `127.0.0.1:8787` (loopback only) |
-| Ingress | `tailscale serve --bg 8787` → `https://relayhost.<tailnet>.ts.net` |
+| Ingress | `tailscale serve --bg 8787` → `https://relayhost.example-tailnet.ts.net` |
 | Egress | `api.telegram.org:443` only |
-| Storage | SQLite at `/var/lib/index01/jobs.db`, < 10 MB expected |
-| Dependencies | `fastapi`, `uvicorn`, `httpx`; NemoClaw v0.0.103 + OpenShell on host |
+| Storage | SQLite at `/var/lib/index01/jobs.db`, < 10 MB expected. **Holds every transcript** — gitignored, and worth remembering before sharing the directory |
+| Dependencies | `fastapi`, `uvicorn`, `httpx`, **`python-multipart`** (without it Starlette cannot parse the webhook body at all); NemoClaw v0.0.102 + OpenShell on host |
 | Talks to | Pebble app (in), Telegram API (out/in), NemoClaw (local subprocess) |
 
 ## 10. Failure modes
@@ -224,19 +272,26 @@ before first run.
 | Relay restart mid-job | `EXECUTING` jobs marked `FAILED` on boot; `PROPOSED` jobs survive |
 | Unparseable payload | `400`, logged, no job created |
 
-## 11. Acceptance criteria
+| # | Criterion | Status |
+|---|-----------|--------|
+| 1 | A note without the trigger phrase produces no Telegram traffic and no agent run | ✅ verified live from the ring |
+| 2 | A read-only request returns a result to Telegram with no approval prompt | ❌ **not met, deliberately** — `REQUIRE_APPROVAL_ALL` gates every turn while `NEMOCLAW_AGENT_RO` can still mutate |
+| 3 | A mutating request produces a proposal showing the verbatim transcript, and **nothing executes** until Approve is tapped | ✅ verified live (the tool name is not shown — see Q4) |
+| 4 | Tapping Deny leaves no trace of execution and disables the buttons | ✅ verified live |
+| 5 | A proposal older than `APPROVAL_TTL` cannot be approved | ✅ covered by tests; not yet seen in production |
+| 6 | A callback from any user other than `TELEGRAM_OWNER_ID` is rejected and logged | ✅ covered by tests; not yet seen in production |
+| 7 | Replaying the same webhook payload twice runs the agent once | ⚠️ covered by tests against `recordedAt`; **untested against a real Pebble retry** |
+| 8 | `curl` to `relayhost:8787` from a non-tailnet LAN device is refused | ⚠️ **untested** |
+| 9 | Relay restart with a pending proposal preserves it as approvable | ✅ covered by tests |
 
-1. A note without the trigger phrase produces no Telegram traffic and no agent run.
-2. A read-only request returns a result to Telegram with no approval prompt.
-3. A mutating request produces a proposal showing the verbatim transcript and the
-   tool to be called, and **nothing executes** until Approve is tapped.
-4. Tapping Deny leaves no trace of execution and disables the buttons.
-5. A proposal older than `APPROVAL_TTL` cannot be approved.
-6. A callback from any Telegram user other than `TELEGRAM_OWNER_ID` is rejected
-   and logged.
-7. Replaying the same webhook payload twice runs the agent once.
-8. `curl` to `relayhost:8787` from another LAN (non-tailnet) device is refused.
-9. Relay restart with a pending proposal preserves it as approvable.
+Criterion 3 is worth a note: on 2026-08-20 the ring transcribed one note as "what's
+the op time?" and another as "what's the uptime?". The mis-heard one was denied and
+the correct one approved, from the verbatim transcript alone. That is the design
+premise working in production.
+
+Regression suites in `tests/` run without credentials and stub Telegram and the
+agent: `test_acceptance.py` (42 checks), `test_multipart.py` (18),
+`test_redaction.py` (10), `test_classify.py` (classifier and gate flag).
 
 ## 12. Open questions
 
@@ -286,12 +341,11 @@ before first run.
     static regex pass over the transcript (`classify()` in `index01_relay.py`):
     any mutating verb forces the gate; only an affirmatively recognised
     read-only question skips it; everything else fails closed.
-  - The confirmed invocation is
-    `nemoclaw <sandbox> agent --agent <id> --session-key <key> --message-file <path> --timeout <s> --json`.
-    `--message-file` is used rather than `-m` so the untrusted transcript never
-    reaches argv. `--deliver` is **never** passed — with it the agent would reply
-    to Telegram itself and route around the gate.
-  - A fresh `--session-key` per job keeps turns stateless (section 3).
+  - The confirmed invocation is in section 6.3. Note it uses `-m`, **not**
+    `--message-file`: an earlier draft of this spec recommended the file form to
+    keep the untrusted transcript out of argv, and that turned out to be
+    impossible — the path is resolved inside the sandbox container. Do not
+    "restore" it.
 - **Q5: RESOLVED — a second bot is required.** `@existing_bot` is already
   enabled, connected and in `mode:polling` for the `the-king` sandbox's OpenClaw
   Telegram channel. Telegram hands each update to exactly one `getUpdates`
@@ -340,11 +394,26 @@ sudo, no setuid, and `NoNewPrivileges` on both halves.
 
 ## 13. Phasing
 
-| Phase | Deliverable | Exit criteria |
-|-------|-------------|---------------|
-| 0 | Tailnet + bot + service user | `/health` reachable over ts.net |
-| 1 | Payload discovery | real schema documented, Q1 closed |
-| 2 | Transcript → Telegram echo | ring press appears in Telegram |
-| 3 | Read-only agent turns | AC 1, 2 pass |
-| 4 | Approval gate | AC 3–6, 9 pass |
-| 5 | Hardening | AC 7, 8 pass; S7 applied; logging reduced |
+Built and deployed on `relayhost`, 2026-08-20.
+
+| Phase | Deliverable | Status |
+|-------|-------------|--------|
+| 0 | Tailnet + bot + service user | ✅ `/health` reachable over ts.net; service enabled |
+| 1 | Payload discovery | ✅ Q1 closed from a real delivery, parser narrowed to the confirmed keys |
+| 2 | Transcript → Telegram | ✅ ring press appears in Telegram |
+| 3 | Read-only agent turns | ⚠️ turns work, but every one is gated — AC2 open pending a restricted agent |
+| 4 | Approval gate | ✅ AC 3, 4 verified live; 5, 6, 9 covered by tests |
+| 5 | Hardening | ⚠️ S7 applied and secrets redacted from logs; AC 7 and 8 still untested |
+
+### Remaining work
+
+1. **Restricted read-only agent** in the sandbox, then `REQUIRE_APPROVAL_ALL=false`.
+   Closes AC2 and satisfies S6. Until then every question costs a tap.
+2. **AC7 and AC8** — a real duplicate-delivery test and the non-tailnet LAN refusal.
+3. **S9** — the split worker described in Q6, to stop running as `democenter`.
+4. **S12** — the work-data boundary. Telegram bot chats are not end-to-end
+   encrypted, and this is currently a rule held in the owner's head, not in code.
+5. **Reboot** has not been exercised. Everything needed is `enabled` and the
+   container is `restart=unless-stopped`, but the port-18789 forward is an
+   unsupervised process; `nemoclaw the-king recover` re-creates host forwards if
+   the dashboard is wanted. Agent turns do not appear to need it.
