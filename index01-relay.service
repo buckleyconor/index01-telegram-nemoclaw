@@ -1,0 +1,65 @@
+[Unit]
+Description=Index 01 voice relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Runs as democenter, not a dedicated user. S9 is consciously deferred: the relay
+# must exec the NemoClaw CLI, whose binary and state live in this home directory,
+# and every alternative was worse. The HTTP gateway path is disabled by default,
+# its token is a full-operator credential, and its port is an ephemeral ssh
+# forward; a sudo wrapper needs setuid and so cannot coexist with
+# NoNewPrivileges. SPEC section 1 puts the approval gate, not uid separation, as
+# the primary control. See "split worker" in SPEC section 12 to recover S9.
+User=democenter
+Group=democenter
+EnvironmentFile=/etc/index01.env
+WorkingDirectory=/opt/index01
+# S1: loopback only. tailscale serve proxies to localhost; 0.0.0.0 would also
+# expose the port to the home LAN.
+ExecStart=/opt/index01/venv/bin/uvicorn index01_relay:app --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+
+# Hardening. This process parses untrusted webhook input, so it keeps everything
+# that does not break the agent subprocess.
+NoNewPrivileges=true
+ProtectSystem=strict
+# read-only rather than true: the NemoClaw binary lives under this home and must
+# stay executable, while the state it mutates is reopened for writing below.
+#
+# .config/openshell is not optional. The CLI rewrites active_gateway on *every*
+# invocation, so without it an agent turn dies with "failed to set permissions on
+# /home/democenter/.config/openshell (Read-only file system)", followed by a
+# misleading "active OpenShell gateway is 'another gateway'" -- the gateway is not
+# actually wrong, the CLI just could not record its choice.
+ProtectHome=read-only
+ReadWritePaths=/var/lib/index01 /home/democenter/.nemoclaw /home/democenter/.config/openshell
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# Deliberately NOT set, and both would be easy to re-add by reflex:
+#
+#   MemoryDenyWriteExecute=true
+#     The nemoclaw CLI is Node. This blocks V8's JIT and the agent subprocess
+#     dies with an error that does not point back at systemd.
+#
+#   PrivateTmp=true
+#     Suspect this first if the relay reaches Telegram but cannot reach the
+#     sandbox: openshell IPC may use a socket under /tmp, which a private tmp
+#     namespace hides. RestrictNamespaces is the next thing to try dropping.
+#
+# When an agent turn fails, read the error out of the job row rather than guessing
+# -- it carries the subprocess stderr:
+#   sqlite3 /var/lib/index01/jobs.db \
+#     "SELECT state, error FROM jobs ORDER BY created_at DESC LIMIT 1;"
+# A filesystem error naming a path under $HOME means that path needs adding to
+# ReadWritePaths above.
+
+[Install]
+WantedBy=multi-user.target
