@@ -106,8 +106,8 @@ agent cannot emit a plan before executing, so there is no tool name to inspect.
 Classification therefore runs over the **transcript**, in `classify()`:
 
 1. `REQUIRE_APPROVAL_ALL` (default **true**) — every turn requires approval.
-   Currently on, because a "read-only" turn still runs on an agent that could
-   mutate. See the residual risks in section 7.
+   Currently on, because a "read-only" turn still runs in a sandbox with
+   unrestricted exec. See the residual risks in section 7.
 2. Otherwise, any match against `MUTATING_PATTERNS` requires approval. Checked
    first and deliberately broad: a false positive costs one tap, a false negative
    runs unreviewed.
@@ -221,12 +221,28 @@ nemoclaw <sandbox> agent --agent <id> --session-key index01-<job_id> \
   worker" authorises whatever the agent decides that means, and the sandbox
   policy — not the gate — is what bounds it. The proposal message says so
   explicitly rather than implying a precision the design does not have.
-- **Read-only turns are only as read-only as the agent they run on.** With no
-  per-invocation tool restriction available, a turn classified read-only still
-  runs an agent that could call mutating tools. `NEMOCLAW_AGENT_RO` exists so a
-  restricted agent can be pointed at, but until one is created it defaults to
-  `main` and acceptance criterion 2's "no ability to change anything" is **not**
-  yet met. Creating that agent is the correct close-out for Phase 3.
+- **Read-only turns are only as read-only as the *sandbox* they run in, and
+  `NEMOCLAW_AGENT_RO` is the wrong lever.** Verified against OpenClaw 2026.7.1:
+  `openclaw agents add` creates an isolated agent in terms of *workspace, auth and
+  routing* only — its flags are `--agent-dir`, `--workspace`, `--model`, `--bind`,
+  and nothing else. There is no per-agent tool or capability restriction. Two
+  agents in one sandbox are equally powerful.
+
+  Capability is controlled one level up, per **sandbox**:
+  - network egress by policy preset (`nemoclaw <name> policy list`)
+  - exec by `openclaw exec-policy`, whose config and approvals are sandbox-wide
+    files (`$OPENCLAW_HOME/.openclaw/openclaw.json`, `exec-approvals.json`)
+
+  So AC2 cannot be closed by adding an agent. It needs a **second sandbox** with a
+  minimal preset set and `openclaw exec-policy preset deny-all`, plus a
+  `NEMOCLAW_SANDBOX_RO` setting the relay does not currently have.
+
+  Current blast radius, stated plainly: `the-king` runs with exec policy
+  `security=full, ask=off` and has the `telegram` preset enabled, so an approved
+  turn has unrestricted exec and direct reach to the Telegram Bot API. The gate
+  still holds — it runs before execution — but **S6 is not met at all**, and
+  `REQUIRE_APPROVAL_ALL` is the only thing standing between a mis-heard question
+  and that capability.
 
 ## 8. Configuration
 
@@ -245,7 +261,7 @@ nemoclaw <sandbox> agent --agent <id> --session-key index01-<job_id> \
 | `LOG_TRANSCRIPTS` | `false` | when `true`, logs payload field *names* only, never values (S7) |
 | `NEMOCLAW_CMD` | `["/home/democenter/.local/bin/nemoclaw"]` | argv prefix as a JSON list; the privilege boundary is configuration, not code |
 | `NEMOCLAW_SANDBOX` | `the-king` | |
-| `NEMOCLAW_AGENT_RO` | `main` | agent for read-only turns; `main` can mutate, hence `REQUIRE_APPROVAL_ALL` |
+| `NEMOCLAW_AGENT_RO` | `main` | agent for read-only turns. Note this cannot restrict capability — see section 7 |
 | `NEMOCLAW_AGENT_RW` | `main` | agent for gated turns |
 
 ## 9. Deployment profile
@@ -275,7 +291,7 @@ nemoclaw <sandbox> agent --agent <id> --session-key index01-<job_id> \
 | # | Criterion | Status |
 |---|-----------|--------|
 | 1 | A note without the trigger phrase produces no Telegram traffic and no agent run | ✅ verified live from the ring |
-| 2 | A read-only request returns a result to Telegram with no approval prompt | ❌ **not met, deliberately** — `REQUIRE_APPROVAL_ALL` gates every turn while `NEMOCLAW_AGENT_RO` can still mutate |
+| 2 | A read-only request returns a result to Telegram with no approval prompt | ❌ **not met, deliberately** — `REQUIRE_APPROVAL_ALL` gates every turn. Closing it needs a second sandbox, not a second agent (section 7) |
 | 3 | A mutating request produces a proposal showing the verbatim transcript, and **nothing executes** until Approve is tapped | ✅ verified live (the tool name is not shown — see Q4) |
 | 4 | Tapping Deny leaves no trace of execution and disables the buttons | ✅ verified live |
 | 5 | A proposal older than `APPROVAL_TTL` cannot be approved | ✅ covered by tests; not yet seen in production |
@@ -401,14 +417,16 @@ Built and deployed on `relayhost`, 2026-08-20.
 | 0 | Tailnet + bot + service user | ✅ `/health` reachable over ts.net; service enabled |
 | 1 | Payload discovery | ✅ Q1 closed from a real delivery, parser narrowed to the confirmed keys |
 | 2 | Transcript → Telegram | ✅ ring press appears in Telegram |
-| 3 | Read-only agent turns | ⚠️ turns work, but every one is gated — AC2 open pending a restricted agent |
+| 3 | Read-only agent turns | ⚠️ turns work, but every one is gated — AC2 open pending a restricted *sandbox* |
 | 4 | Approval gate | ✅ AC 3, 4 verified live; 5, 6, 9 covered by tests |
 | 5 | Hardening | ⚠️ S7 applied and secrets redacted from logs; AC 7 and 8 still untested |
 
 ### Remaining work
 
-1. **Restricted read-only agent** in the sandbox, then `REQUIRE_APPROVAL_ALL=false`.
-   Closes AC2 and satisfies S6. Until then every question costs a tap.
+1. **Restricted read-only sandbox**, plus a `NEMOCLAW_SANDBOX_RO` setting the
+   relay does not yet have, then `REQUIRE_APPROVAL_ALL=false`. Closes AC2 and
+   makes a start on S6. An extra *agent* cannot do this — see section 7. Until
+   then every question costs a tap.
 2. **AC7 and AC8** — a real duplicate-delivery test and the non-tailnet LAN refusal.
 3. **S9** — the split worker described in Q6, to stop running as `democenter`.
 4. **S12** — the work-data boundary. Telegram bot chats are not end-to-end

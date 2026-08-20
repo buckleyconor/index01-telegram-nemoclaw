@@ -245,10 +245,25 @@ A filesystem error naming a path under `$HOME` means that path needs adding to
 `NEMOCLAW_AGENT_RO` defaults to an agent that can still mutate — so a "read-only"
 classification describes the phrasing, not the capability.
 
-To close AC2: create a restricted agent in the sandbox with the narrowest viable
-toolset (S6), point `NEMOCLAW_AGENT_RO` at it, then set `REQUIRE_APPROVAL_ALL=false`.
-This has not been done, so the classifier's read-only branch has never run in
-production.
+**Adding an OpenClaw agent will not do it.** `openclaw agents add` isolates
+workspace, auth and routing — its only flags are `--agent-dir`, `--workspace`,
+`--model` and `--bind`. There is no per-agent tool restriction, so a second agent
+in the same sandbox is exactly as powerful as `main`.
+
+Capability lives one level up, per sandbox: network egress via
+`nemoclaw <name> policy`, and exec via `openclaw exec-policy`, whose config and
+approvals are sandbox-wide files. Closing AC2 therefore means a **second sandbox**:
+
+```bash
+# sketch only -- not performed, see SPEC section 7
+nemoclaw <ro-sandbox> policy add public-reference     # and little else
+nemoclaw <ro-sandbox> exec exec-policy preset deny-all
+```
+
+then a `NEMOCLAW_SANDBOX_RO` setting the relay does not yet have —
+`NEMOCLAW_AGENT_RO` alone cannot express this. Until that exists,
+`REQUIRE_APPROVAL_ALL` stays `true` and the classifier's read-only branch never
+runs in production.
 
 ### Exit test
 

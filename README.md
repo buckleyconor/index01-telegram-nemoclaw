@@ -43,8 +43,9 @@ sqlite3 /var/lib/index01/jobs.db \
 ## Four things that will look like bugs
 
 1. **Every turn asks for approval, even questions.** Deliberate. `REQUIRE_APPROVAL_ALL`
-   is on because a "read-only" turn still runs on an agent that could mutate.
-   Acceptance criterion 2 is knowingly unmet until a restricted agent exists.
+   is on because a "read-only" turn still runs in a sandbox with unrestricted exec.
+   Acceptance criterion 2 is knowingly unmet, and closing it needs a second
+   *sandbox* — per-agent tool restriction does not exist. See SPEC section 7.
 2. **Notes still appear in the Pebble app, and questions still get answered there.**
    The webhook fires *in addition to* the app's own on-device agent. Answers you see
    without saying the trigger phrase came from the phone, not this host.
